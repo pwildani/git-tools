@@ -9,13 +9,13 @@ COMMIT_TEMPLATE = \
 """
 Restore "{original_commit_subject}"
 
-This restores {original_commit_id}
+This restores commit {original_commit_id}
 
 {extra_notes}
 {original_commit_body}
 """
 
-REVERT_RX = re.compile('This reverts commit (.*).')
+REVERT_RX = re.compile('(?:This reverts commit|This restores commit) (.*).')
 
 
 def commit_description(commit_id):
@@ -91,6 +91,7 @@ for commit in commit_rev_topo_order(args.commits):
       if m:
         rtarget = m.group(1)
         is_revert = True
+        extra.append('Related commit: %s' % rtarget)
       else:
         extra.append(line)
     if is_revert:
@@ -108,6 +109,8 @@ for commit in commit_rev_topo_order(args.commits):
     extra_notes='\n'.join(extra) + ('\n' if extra else ''),
   )
 
+  # This is basically a rebase with a reword on the target commit, but that's
+  # not trivially expressible as a script.
   to_restore = commits_after(revert)
   print 'to_restore', to_restore
   run(['git', 'reset', '--hard', revert])
