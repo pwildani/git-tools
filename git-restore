@@ -1,0 +1,115 @@
+#!/usr/bin/env python
+
+import argparse
+import re
+import subprocess
+import sys
+
+COMMIT_TEMPLATE = \
+"""
+Restore "{original_commit_subject}"
+
+This restores {original_commit_id}
+
+{extra_notes}
+{original_commit_body}
+"""
+
+REVERT_RX = re.compile('This reverts commit (.*).')
+
+
+def commit_description(commit_id):
+  """Returns: (subject, body)"""
+  raw = check_output([
+    'git', 'show', '-s', '--format=format:%B', str(commit_id)])
+  lines = raw.strip().split('\n')
+  body_start = 1
+  if len(lines) > 2 and not lines[1]:
+    body_start = 2
+  return lines[0], '\n'.join(lines[body_start:])
+
+
+def commit_rev_topo_order(commit_ids):
+  """ 'newest' commit first """
+  raw = check_output(['git', 'rev-list'] + commit_ids)
+  lines = raw.strip().split('\n')
+  return [l for l in lines if l in commit_ids]
+
+def run(commandline):
+  print commandline
+  return subprocess.check_call(commandline)
+
+def check_output(commandline):
+  print commandline
+  return subprocess.check_output(commandline)
+
+def commits_after(commit_id):
+  raw = subprocess.check_output([
+    'git', 'log', '--format=format:%H',
+    commit_id + '..'])
+  return raw.strip().split('\n')
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+  "--rewrite-revert-to-restore-in-place",
+  action="store_true",
+  dest="inplace",
+  default=False, help="Apply the restore template to an already-existing commit created by git-revert")
+parser.add_argument("commits", help="hash of commits to restore", nargs="*")
+args = parser.parse_args()
+
+
+history = check_output(['git', 'rev-list', 'HEAD']).split('\n')
+for commit in args.commits:
+  if commit not in history:
+    print 'commit %s is not an ancestor of HEAD. It is unsafe to do a restore.' % commit
+    sys.exit(1)
+
+for commit in commit_rev_topo_order(args.commits):
+  if args.inplace:
+    revert = commit
+
+  else:
+    print 'not in place is not implemented yet, git revert the revert to undo then use --rewrite-revert-to-restore-in-place'
+    # TODO: execute a git revert on a revert then mutate that commit into a restore.
+    revert = None
+    sys.exit(1)
+
+  # We have a git-revert created commit. Transform it into a restore.
+
+  rtarget = revert
+  target = None
+  is_revert = True
+  extra = []
+  while is_revert:
+    is_revert = False
+    print 'Examining revert', rtarget
+    subject, body = commit_description(rtarget)
+    for line in body.split('\n'):
+      m = REVERT_RX.match(body)
+      if m:
+        rtarget = m.group(1)
+        is_revert = True
+      else:
+        extra.append(line)
+    if is_revert:
+      target = rtarget
+  if not target:
+    print 'Commit %s is not a revert' % revert
+    sys.exit(1)
+
+  tsubject, tbody = commit_description(target)
+
+  new_desc = COMMIT_TEMPLATE.format(
+    original_commit_subject=tsubject,
+    original_commit_id=target,
+    original_commit_body=tbody,
+    extra_notes='\n'.join(extra) + ('\n' if extra else ''),
+  )
+
+  to_restore = commits_after(revert)
+  print 'to_restore', to_restore
+  run(['git', 'reset', '--hard', revert])
+  run(['git', 'commit', '--amend', '-m', new_desc])
+  run(['git', 'cherry-pick'] + list(reversed(to_restore)))
