@@ -11,11 +11,16 @@ Restore "{original_commit_subject}"
 
 This restores commit {original_commit_id}
 
-{extra_notes}
-{original_commit_body}
+{related_commits}
+{new_body}
 """
 
 REVERT_RX = re.compile('(?:This reverts commit|This restores commit) (.*).')
+
+# This is also the signature separator in mime text-plain content (i.e. email).
+# It's used here so that emailing these commits around doesn't mess up the
+# formatting.
+MULTI_BODY_MARKER = "-- "
 
 
 def commit_description(commit_id):
@@ -47,7 +52,7 @@ def commits_after(commit_id):
   raw = subprocess.check_output([
     'git', 'log', '--format=format:%H',
     commit_id + '..'])
-  return raw.strip().split('\n')
+  return [r for r in raw.strip().split('\n') if r]
 
 
 parser = argparse.ArgumentParser()
@@ -78,23 +83,39 @@ for commit in commit_rev_topo_order(args.commits):
 
   # We have a git-revert created commit. Transform it into a restore.
 
+  # Find the original commit for the revert, including going back through
+  # chains of revert-restore-revert...
   rtarget = revert
   target = None
-  is_revert = True
-  extra = []
-  while is_revert:
-    is_revert = False
+  is_original = False
+  extras = []
+  related = set()
+  while not is_original:
     print 'Examining revert', rtarget
+    is_original = True
     subject, body = commit_description(rtarget)
-    for line in body.split('\n'):
+
+    # Examine the body for evidence of git-revert or this script being run on
+    # it.
+    lines = iter(body.split('\n'))
+    for line in lines:
       m = REVERT_RX.match(body)
       if m:
         rtarget = m.group(1)
-        is_revert = True
-        extra.append('Related commit: %s' % rtarget)
+        is_original = False
+        related.add(rtarget)
       else:
-        extra.append(line)
-    if is_revert:
+        m = re.match('Related commit: (.*)')
+        if m:
+          related.add(m.group(1))
+        elif line:
+          # After the extra cruft revert and restore add at the start.
+          # Accumulate description blocks from the rest of the lines here.
+          extras.extend('\n'.join(lines).split(MULTI_BODY_MARKER))
+          # lines is alerady consumed, so the loop should end here anyway
+          break
+
+    if not is_original:
       target = rtarget
   if not target:
     print 'Commit %s is not a revert' % revert
@@ -102,11 +123,25 @@ for commit in commit_rev_topo_order(args.commits):
 
   tsubject, tbody = commit_description(target)
 
+  related = '\n'.join('Related commit: ' + r for r in sorted(related))
+  extras[0:0] = [tbody.strip()]
+  extras = [e.strip() for e in extras]
+
+  # deduplicate previous change body descriptions without changing the order.
+  blocks = set(extras)
+  newbody = []
+  for e in extras:
+    if e in blocks and e:
+      newbody.append(e)
+      blocks.remove(e)
+
+  newbody = ('\n\n%s\n\n'%(MULTI_BODY_MARKER)).join(newbody)
+
   new_desc = COMMIT_TEMPLATE.format(
     original_commit_subject=tsubject,
     original_commit_id=target,
-    original_commit_body=tbody,
-    extra_notes='\n'.join(extra) + ('\n' if extra else ''),
+    related_commits=related + ('\n' if related else ''),
+    new_body=newbody,
   )
 
   # This is basically a rebase with a reword on the target commit, but that's
@@ -115,4 +150,5 @@ for commit in commit_rev_topo_order(args.commits):
   print 'to_restore', to_restore
   run(['git', 'reset', '--hard', revert])
   run(['git', 'commit', '--amend', '-m', new_desc])
-  run(['git', 'cherry-pick'] + list(reversed(to_restore)))
+  if to_restore:
+    run(['git', 'cherry-pick'] + list(reversed(to_restore)))
