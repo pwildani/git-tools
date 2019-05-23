@@ -12,3 +12,7 @@ Misc git related tooling
    git-restore --rewrite-revert-to-restore-in-place ABCD
    ```
 
+* git-slice: Rewrite history to only include changes specifically named files,
+  over a specific commit range. This is probabably even more dangerous than it
+  sounds.  Warning: this is from before when I figured out how to add entries
+  to the reflog, so there's less safety net than you might think.
