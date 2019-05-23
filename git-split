@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""
+Selects files from a range of commits and splits changes to those files into
+their own commits by splitting them out of the original commits and integrating
+them into the commit history in an adjacent position.
+"""
+
+import argparse
+import subprocess
+import os
+
+
+def setup_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input_range')
+    parser.add_argument('filenames', nargs='+')
+    return parser
+
+def cmd_to_bytes(cmd):
+    return [x if isinstance(x, bytes) else x.encode('ascii') for x in cmd]
+
+def check_output(cmd):
+    print(cmd)
+    return subprocess.check_output(cmd_to_bytes(cmd))
+
+def output_or_none(cmd):
+    """return output or None if the command failed."""
+    try:
+        return subprocess.check_output(cmd_to_bytes(cmd))
+    except subprocess.CalledProcessError:
+        return None
+
+def run(cmd):
+    print(cmd)
+    return subprocess.check_call(cmd_to_bytes(cmd))
+
+
+command_cache = {}
+def cached_output(commandline, update=False):
+    if not update and tuple(commandline) in command_cache:
+        return command_cache[tuple(commandline)]
+    out = check_output(commandline)
+    command_cache[tuple(commandline)] = out
+    return out
+
+
+def commit_description(commit_id):
+    """Returns: (subject, body)"""
+    raw = cached_output([
+        'git', 'show', '-s', '--format=format:%B', str(commit_id)])
+    lines = raw.decode('latin-1').strip().split('\n')
+    body_start = 1
+    if len(lines) > 2 and not lines[1]:
+        body_start = 2
+    return lines[0].encode('latin-1'), ('\n'.join(lines[body_start:])).encode('latin-1')
+
+def head_commit(update=False):
+    return normalize_ref_name('HEAD', update=False)
+
+
+def normalize_ref_name(ref, update=False):
+    return cached_output(['git', 'rev-parse', ref], update=True).strip()
+
+
+def is_a_branch_name(name):
+    git_root = '.git' # TODO ask git for this
+    return os.path.exists(os.path.join(git_root, 'refs/heads', name))
+
+
+def compose_description(subject, body):
+    if body:
+        return subject + b'\n\n' + body
+    return subject
+
+
+def commit_touches_file(commit, filename):
+    touched_files = cached_output(
+        ['git', 'diff', '--name-only', commit + '^', commit]).decode('latin-1').strip().split('\n')
+    # if filename in touched_files: print('touches:', filename)
+    return filename in touched_files
+
+def commit_other_files(commit, filenames):
+    filenames = set(filenames)
+    touched_files = cached_output(
+        ['git', 'diff', '--name-only', commit + '^', commit]).decode('latin-1').strip().split('\n')
+    # if filename in touched_files: print('touches:', filename)
+    return list(set(touched_files) - filenames)
+
+
+def main():
+    parser = setup_args()
+    args = parser.parse_args()
+    if '..' in args.input_range:
+        split_revs = check_output(['git', 'rev-list', args.input_range])
+        split_revs = split_revs.decode('ascii').strip().split('\n')
+        split_revs.reverse()
+    else:
+        split_revs = [args.input_range]
+    print ('Planning to split commits', split_revs)
+
+    revs = check_output(['git', 'rev-list', split_revs[0] + '^..HEAD'])
+    revs = revs.decode('ascii').strip().split('\n')
+    revs.reverse()
+    print('In ', revs, 'editing commits', split_revs)
+    pre_head = head_commit().decode('latin-1')
+
+    unsafe = check_output(['git', 'status', '--porcelain', '--untracked-files=no'])
+    if unsafe:
+        print('Pending changes, proceding is unsafe')
+        sys.exit(1)
+
+    # TODO: Mark reflog for ease of undo. This doesn't work. The git reset below breaks things, but without that the intermediate git commits don't keep the current ref up to date.
+    reflog_msg = 'Before: git split ' + args.input_range + ' ' + ' '.join(args.filenames)
+    current_branch = output_or_none(['git', 'symbolic-ref', '--short', '-q', 'HEAD']).strip()
+    base = split_revs[0] + '^'
+    run(['git', 'update-ref', '-m', reflog_msg, 'HEAD', base])
+    run(['git', 'reset', '--hard'])
+
+
+    for commit in revs:
+        print('examining commit', commit)
+        if commit in split_revs:
+            print('want to split commit', commit)
+            focused_files = [f for f in args.filenames if commit_touches_file(commit, f)]
+            other_files = commit_other_files(commit, focused_files)
+            print('found: ', focused_files)
+            print('other: ', other_files)
+
+            if focused_files and other_files:
+                # Other files
+                run(['git', 'checkout', commit, '--'] + other_files)
+                title, body = commit_description(commit)
+                body += ('\n\nFiles:\n * ' + '\n * '.join(other_files)).encode('latin-1')
+                descr = compose_description(title, body)
+                run(['git', 'commit', '-m', descr] + other_files)
+
+                # then focused files
+                run(['git', 'checkout', commit, '--'] + focused_files)
+                title, body = commit_description(commit)
+                body += ('\n\nFiles:\n' + '\n * '.join(focused_files)).encode('latin-1')
+                descr = compose_description(title, body)
+                run(['git', 'commit', '-m', descr] + focused_files)
+
+            else:
+                print('boring, no files found to split out: ', commit)
+                run(['git', 'cherry-pick', commit])
+        else:
+            print('boring, Just patch it in: ', commit)
+            run(['git', 'cherry-pick', commit])
+
+
+    post_head = head_commit(update=True)
+
+    print('Split commits at {}..{}'.format(base, post_head))
+    if current_branch:
+        run(['git', 'update-ref', current_branch, post_head])
+
+
+    return
+
+if __name__ == '__main__':
+    main()
