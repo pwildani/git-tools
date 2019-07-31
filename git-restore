@@ -16,6 +16,7 @@ This restores commit {original_commit_id}
 """
 
 REVERT_RX = re.compile('(?:This reverts commit|This restores commit) (.*).')
+RELATED_RX = re.compile('Related commit: (.*)')
 
 # This is also the signature separator in mime text-plain content (i.e. email).
 # It's used here so that emailing these commits around doesn't mess up the
@@ -24,131 +25,197 @@ MULTI_BODY_MARKER = "-- "
 
 
 def commit_description(commit_id):
-  """Returns: (subject, body)"""
-  raw = check_output([
-    'git', 'show', '-s', '--format=format:%B', str(commit_id)])
-  lines = raw.strip().split('\n')
-  body_start = 1
-  if len(lines) > 2 and not lines[1]:
-    body_start = 2
-  return lines[0], '\n'.join(lines[body_start:])
+    """Returns: (subject, body)"""
+    raw = cached_output([
+        'git', 'show', '-s', '--format=format:%B', str(commit_id)])
+    lines = raw.strip().split('\n')
+    body_start = 1
+    if len(lines) > 2 and not lines[1]:
+        body_start = 2
+    return lines[0], '\n'.join(lines[body_start:])
 
 
 def commit_rev_topo_order(commit_ids):
-  """ 'newest' commit first """
-  raw = check_output(['git', 'rev-list'] + commit_ids)
-  lines = raw.strip().split('\n')
-  return [l for l in lines if l in commit_ids]
+    """ 'newest' commit first """
+    commit_ids = map(normalize_ref_name, commit_ids)
+    raw = cached_output(['git', 'rev-list'] + commit_ids)
+    lines = raw.strip().split('\n')
+    return [l for l in lines if l in commit_ids]
 
-def run(commandline):
-  print commandline
-  return subprocess.check_call(commandline)
+
+def run_unchecked(commandline):
+    print commandline
+    return subprocess.check_call(commandline)
+
+
+def run_mutate(commandline):
+    # TODO add a dry run flag that skips this step
+    run_unchecked(commandline)
+
 
 def check_output(commandline):
-  print commandline
-  return subprocess.check_output(commandline)
+    #print commandline
+    return subprocess.check_output(commandline)
+
+
+command_cache = {}
+def cached_output(commandline, update=False):
+    if not update and tuple(commandline) in command_cache:
+        return command_cache[tuple(commandline)]
+    out = check_output(commandline)
+    command_cache[tuple(commandline)] = out
+    return out
+
 
 def commits_after(commit_id):
-  raw = subprocess.check_output([
-    'git', 'log', '--format=format:%H',
-    commit_id + '..'])
-  return [r for r in raw.strip().split('\n') if r]
+    raw = cached_output([
+        'git', 'log', '--format=format:%H',
+        commit_id + '..'])
+    return [r for r in raw.strip().split('\n') if r]
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument(
-  "--rewrite-revert-to-restore-in-place",
-  action="store_true",
-  dest="inplace",
-  default=False, help="Apply the restore template to an already-existing commit created by git-revert")
-parser.add_argument("commits", help="hash of commits to restore", nargs="*")
-args = parser.parse_args()
+def head_commit(update=False):
+    return normalize_ref_name('HEAD', update=False)
 
 
-history = check_output(['git', 'rev-list', 'HEAD']).split('\n')
-for commit in args.commits:
-  if commit not in history:
-    print 'commit %s is not an ancestor of HEAD. It is unsafe to do a restore.' % commit
-    sys.exit(1)
+def normalize_ref_name(ref, update=False):
+    return cached_output(['git', 'rev-parse', ref], update=True).strip()
 
-for commit in commit_rev_topo_order(args.commits):
-  if args.inplace:
-    revert = commit
 
-  else:
-    print 'not in place is not implemented yet, git revert the revert to undo then use --rewrite-revert-to-restore-in-place'
-    # TODO: execute a git revert on a revert then mutate that commit into a restore.
-    revert = None
-    sys.exit(1)
+def parse_args(args):
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--rewrite-revert-to-restore-in-place",
+        action="store_true",
+        dest="inplace",
+        default=False, help="Apply the restore template to an already-existing commit created by git-revert")
+    parser.add_argument("commits", help="hash of commits to restore", nargs="*")
+    return parser.parse_args(args)
 
-  # We have a git-revert created commit. Transform it into a restore.
 
-  # Find the original commit for the revert, including going back through
-  # chains of revert-restore-revert...
-  rtarget = revert
-  target = None
-  is_original = False
-  extras = []
-  related = set()
-  while not is_original:
-    print 'Examining revert', rtarget
-    is_original = True
-    subject, body = commit_description(rtarget)
+def compose_restore_body(target, related, extras, already_mentioned):
+    tsubject, tbody = commit_description(target)
 
-    # Examine the body for evidence of git-revert or this script being run on
-    # it.
-    lines = iter(body.split('\n'))
-    for line in lines:
-      m = REVERT_RX.match(body)
-      if m:
-        rtarget = m.group(1)
-        is_original = False
-        related.add(rtarget)
-      else:
-        m = re.match('Related commit: (.*)')
-        if m:
-          related.add(m.group(1))
-        elif line:
-          # After the extra cruft revert and restore add at the start.
-          # Accumulate description blocks from the rest of the lines here.
-          extras.extend('\n'.join(lines).split(MULTI_BODY_MARKER))
-          # lines is alerady consumed, so the loop should end here anyway
-          break
+    related = '\n'.join('Related commit: ' + r for r in commit_rev_topo_order(related) if r not in already_mentioned)
+    extras[0:0] = [tbody.strip()]
+    extras = [e.strip() for e in extras]
 
-    if not is_original:
-      target = rtarget
-  if not target:
-    print 'Commit %s is not a revert' % revert
-    sys.exit(1)
+    # deduplicate previous change body descriptions without changing the order.
+    blocks = set(extras)
+    newbody = []
+    for e in extras:
+        if e in blocks and e:
+            newbody.append(e)
+            blocks.remove(e)
 
-  tsubject, tbody = commit_description(target)
+    newbody = ('\n\n%s\n\n'%(MULTI_BODY_MARKER)).join(newbody)
 
-  related = '\n'.join('Related commit: ' + r for r in sorted(related))
-  extras[0:0] = [tbody.strip()]
-  extras = [e.strip() for e in extras]
+    new_desc = COMMIT_TEMPLATE.format(
+        original_commit_subject=tsubject,
+        original_commit_id=target,
+        related_commits=related + ('\n' if related else ''),
+        new_body=newbody,
+    )
+    return new_desc
 
-  # deduplicate previous change body descriptions without changing the order.
-  blocks = set(extras)
-  newbody = []
-  for e in extras:
-    if e in blocks and e:
-      newbody.append(e)
-      blocks.remove(e)
 
-  newbody = ('\n\n%s\n\n'%(MULTI_BODY_MARKER)).join(newbody)
+def find_restore_related_commits(commit):
+    # Find the original commit for the revert, including going back through
+    # chains of revert-restore-revert...
+    rtarget = commit
+    target = None
+    is_original = False
+    extras = []
+    related = set()
+    while not is_original:
+        print 'Examining', rtarget
+        is_original = True
+        subject, body = commit_description(rtarget)
 
-  new_desc = COMMIT_TEMPLATE.format(
-    original_commit_subject=tsubject,
-    original_commit_id=target,
-    related_commits=related + ('\n' if related else ''),
-    new_body=newbody,
-  )
+        # Examine the body for evidence of git-revert or this script being run on
+        # it.
+        lines = iter(body.split('\n'))
+        for line in lines:
+            m = REVERT_RX.match(body)
+            if m:
+                rtarget = m.group(1)
+                is_original = False
+                related.add(rtarget)
+            else:
+                m = RELATED_RX.match(line)
+                if m:
+                    related.add(m.group(1))
+                elif line:
+                    # After the extra cruft revert and restore add at the start.
+                    # Accumulate description blocks from the rest of the lines here.
+                    extras.extend('\n'.join(lines).split(MULTI_BODY_MARKER))
+                    # lines is alerady consumed, so the loop should end here anyway
+                    break
 
-  # This is basically a rebase with a reword on the target commit, but that's
-  # not trivially expressible as a script.
-  to_restore = commits_after(revert)
-  print 'to_restore', to_restore
-  run(['git', 'reset', '--hard', revert])
-  run(['git', 'commit', '--amend', '-m', new_desc])
-  if to_restore:
-    run(['git', 'cherry-pick'] + list(reversed(to_restore)))
+        if not is_original:
+            target = rtarget
+    return target, related, extras
+
+
+def restore(commit, (target, related, extras)):
+     # We have a git-revert created commit. Transform it into a restore.
+     if not target:
+         print 'Commit %s is not a revert' % commit
+         return
+
+     # TODO: also pull mentions from the pre-existing body
+     seen = set([commit])
+
+     new_desc = compose_restore_body(target, related, extras, already_mentioned=seen)
+
+     # This is basically a rebase with a reword on the target commit, but that's
+     # not trivially expressible as a script.
+     to_restore = commits_after(commit)
+     run_mutate(['git', 'reset', '--hard', commit])
+     run_mutate(['git', 'commit', '--amend', '-m', new_desc])
+     if to_restore:
+         run_mutate(['git', 'cherry-pick'] + list(reversed(to_restore)))
+
+
+def main(args):
+    args = parse_args(args[1:])
+
+    history = [head_commit()] + cached_output(['git', 'rev-list', 'HEAD']).split('\n')
+    rewrite = {}
+    errors = False
+    commits = []
+    for commit in args.commits:
+        if '..' in commit:
+            split_revs = check_output(['git', 'rev-list', commit])
+            split_revs = split_revs.decode('ascii').strip().split('\n')
+            commits.extend(split_revs)
+        else:
+            commits.append(commit)
+    for commit in commits:
+        commit = normalize_ref_name(commit)
+        if commit not in history:
+            print 'commit %s is not an ancestor of HEAD. It is unsafe to do a restore.' % commit
+            errors = True
+
+        rewrite[commit] = find_restore_related_commits(commit)
+        target, related, extras = rewrite[commit]
+        if not target:
+            print 'Commit %s is not a revert' % commit
+            errors = True
+    if errors:
+        print 'Exiting with errors'
+        sys.exit(1)
+
+    for commit in commit_rev_topo_order(commits):
+        if args.inplace:
+            print 'Rewriting', commit
+            revert = commit
+        else:
+            print 'Undoing', commit
+            run_mutate(['git', 'revert', '--no-edit', commit])
+            revert = head_commit(update=True)
+        restore(revert, rewrite[commit])
+
+
+if __name__ == '__main__':
+    main(sys.argv)
