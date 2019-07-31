@@ -4,8 +4,14 @@ Misc git related tooling
 
 * git-restore: when git-revert-ing a previous revert, it's cleaner to label it
   as a restore and include the original commit message. This script does so.
-  (currently doesn't handle the revert itself, but that should just be a
-   matter of coding).
+
+   Add a restore of the original commit starting from a revert.
+   ```
+   git revert bad-commit;  # -> creates revert ABCD
+   git restore ABCD;
+   ```
+
+   For a previous revert, re-render the description:
    ```
    git revert XYZ;
    # freshly created revert-of-revert is ABCD
