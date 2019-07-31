@@ -11,17 +11,20 @@ import os
 
 def setup_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('input_range')
-    parser.add_argument('output_base', default='HEAD')
-    parser.add_argument('filenames', nargs='+')
+    parser.add_argument("input_range")
+    parser.add_argument("output_base", default="HEAD")
+    parser.add_argument("filenames", nargs="+")
     return parser
 
+
 def cmd_to_bytes(cmd):
-    return [x if isinstance(x, bytes) else x.encode('ascii') for x in cmd]
+    return [x if isinstance(x, bytes) else x.encode("ascii") for x in cmd]
+
 
 def check_output(cmd):
     # print(cmd)
     return subprocess.check_output(cmd_to_bytes(cmd))
+
 
 def run(cmd):
     # print(cmd)
@@ -29,6 +32,8 @@ def run(cmd):
 
 
 command_cache = {}
+
+
 def cached_output(commandline, update=False):
     if not update and tuple(commandline) in command_cache:
         return command_cache[tuple(commandline)]
@@ -39,35 +44,40 @@ def cached_output(commandline, update=False):
 
 def commit_description(commit_id):
     """Returns: (subject, body)"""
-    raw = cached_output([
-        'git', 'show', '-s', '--format=format:%B', str(commit_id)])
-    lines = raw.decode('latin-1').strip().split('\n')
+    raw = cached_output(["git", "show", "-s", "--format=format:%B", str(commit_id)])
+    lines = raw.decode("latin-1").strip().split("\n")
     body_start = 1
     if len(lines) > 2 and not lines[1]:
         body_start = 2
-    return lines[0].encode('latin-1'), ('\n'.join(lines[body_start:])).encode('latin-1')
+    return lines[0].encode("latin-1"), ("\n".join(lines[body_start:])).encode("latin-1")
+
 
 def head_commit(update=False):
-    return normalize_ref_name('HEAD', update=False)
+    return normalize_ref_name("HEAD", update=False)
 
 
 def normalize_ref_name(ref, update=False):
-    return cached_output(['git', 'rev-parse', ref], update=True).strip()
+    return cached_output(["git", "rev-parse", ref], update=True).strip()
 
 
 def is_a_branch_name(name):
-    git_root = '.git' # TODO ask git for this
-    return os.path.exists(os.path.join(git_root, 'refs/heads', name))
+    git_root = ".git"  # TODO ask git for this
+    return os.path.exists(os.path.join(git_root, "refs/heads", name))
+
 
 def compose_description(subject, body):
     if body:
-        return subject + b'\n\n' + body
+        return subject + b"\n\n" + body
     return subject
 
 
 def commit_touches_file(commit, filename):
-    touched_files = cached_output(
-        ['git', 'diff', '--name-only', commit + '^', commit]).decode('latin-1').strip().split('\n')
+    touched_files = (
+        cached_output(["git", "diff", "--name-only", commit + "^", commit])
+        .decode("latin-1")
+        .strip()
+        .split("\n")
+    )
     # if filename in touched_files: print('touches:', filename)
     return filename in touched_files
 
@@ -75,43 +85,52 @@ def commit_touches_file(commit, filename):
 def main():
     parser = setup_args()
     args = parser.parse_args()
-    revs = check_output(['git', 'rev-list', args.input_range])
-    revs = revs.decode('ascii').strip().split('\n')
-    #print(revs)
+    revs = check_output(["git", "rev-list", args.input_range])
+    revs = revs.decode("ascii").strip().split("\n")
+    # print(revs)
     revs.reverse()
-    pre_head = head_commit().decode('latin-1')
+    pre_head = head_commit().decode("latin-1")
 
-    base = normalize_ref_name(args.output_base).decode('latin-1')
+    base = normalize_ref_name(args.output_base).decode("latin-1")
     if base != pre_head:
-        run(['git', 'checkout', base])
+        run(["git", "checkout", base])
 
     for commit in revs:
         changed_files = [f for f in args.filenames if commit_touches_file(commit, f)]
-        #print('Changes', changed_files)
-        if changed_files: 
-            run(['git', 'checkout', commit, '--'] + changed_files)
+        # print('Changes', changed_files)
+        if changed_files:
+            run(["git", "checkout", commit, "--"] + changed_files)
             descr = compose_description(*commit_description(commit))
-            run(['git', 'commit', '-m', descr] + changed_files)
+            run(["git", "commit", "-m", descr] + changed_files)
         else:
-            print('Skipping commit {}. No changes to target files'.format(commit))
+            print("Skipping commit {}. No changes to target files".format(commit))
 
     post_head = head_commit(update=True)
 
     if is_a_branch_name(args.output_base):
-        run(['git', 'branch', '-f', args.output_base, post_head])
-        print ('Branch {} now points to {}'.format(args.output_base, post_head))
+        run(["git", "branch", "-f", args.output_base, post_head])
+        print("Branch {} now points to {}".format(args.output_base, post_head))
 
-    if base != pre_head and args.output_base != 'HEAD':
-        run(['git', 'checkout', args.output_base])
+    if base != pre_head and args.output_base != "HEAD":
+        run(["git", "checkout", args.output_base])
     else:
-        print('not resetting HEAD to ', pre_head,'.', 'base=', base, 'output_base=', args.output_base)
+        print(
+            "not resetting HEAD to ",
+            pre_head,
+            ".",
+            "base=",
+            base,
+            "output_base=",
+            args.output_base,
+        )
 
     if base == post_head:
-        print('No changes made!')
+        print("No changes made!")
     else:
-        print('Sliced commits at {}..{}'.format(base, post_head))
+        print("Sliced commits at {}..{}".format(base, post_head))
 
     return
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
